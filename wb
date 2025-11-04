@@ -170,7 +170,7 @@ Then provide your answer in the required JSON format.
                     {"role": "user", "content": user_prompt}
                 ],
                 temperature=TEMPERATURE,
-                max_tokens=MAX_OUTPUT_TOKENS,
+                max_completion_tokens=MAX_OUTPUT_TOKENS,  # Use max_completion_tokens for GPT-5 models
                 top_p=0.95,
                 frequency_penalty=0.0,
                 presence_penalty=0.0,
