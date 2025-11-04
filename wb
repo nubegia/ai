@@ -1,127 +1,248 @@
 # ======================================================================
-# QUICK-TEST SCRIPT — LEGAL ANSWER FETCHER (GPT-5-MINI FINAL VERSION)
+# IMPROVED LEGAL ANSWER FETCHER (GPT-5-MINI - ENHANCED VERSION)
 # ======================================================================
 
 import os
 import ssl
 import certifi
 import httpx
-import re
+import json
 import pandas as pd
 import datetime
 from openai import OpenAI
 
 # ─── CONFIG ───────────────────────────────────────────────────────────
 MODEL                 = os.getenv("OPENAI_MODEL", "gpt-5-mini")   # ✅ Use GPT-5-mini
-API_KEY               = ""  # ← replace with your valid key
-MAX_OUTPUT_TOKENS     = 1000
+API_KEY               = os.getenv("OPENAI_API_KEY", "")  # ← Set via env var or replace here
+MAX_OUTPUT_TOKENS     = 4096
 HTTP_TIMEOUT_SECS     = 600
+TEMPERATURE           = 0.1   # Low temperature for consistent, factual outputs
+MAX_RETRIES           = 2     # Retry attempts for validation failures
 
 if not API_KEY or not API_KEY.startswith("sk-"):
-    raise RuntimeError("❌ Missing or invalid OPENAI_API_KEY. Please provide a valid key.")
+    raise RuntimeError("❌ Missing or invalid OPENAI_API_KEY. Please set it as environment variable or in the script.")
 
 _ctx   = ssl.create_default_context(cafile=certifi.where())
 _http  = httpx.Client(verify=_ctx, timeout=HTTP_TIMEOUT_SECS, follow_redirects=True)
 client = OpenAI(api_key=API_KEY, http_client=_http)
 
-print("✅ OpenAI client initialized successfully (GPT-5-mini).")
+print("✅ OpenAI client initialized successfully (GPT-5-mini with enhanced settings).")
 
 # ======================================================================
-# SYSTEM PROMPT TEMPLATE
+# SYSTEM PROMPT TEMPLATE (ENHANCED WITH EXAMPLES & JSON OUTPUT)
 # ======================================================================
 
 SYSTEM_PROMPT_TMPL = """
-You are a senior legal and private-sector expert on Assets and women’s rights in {economy}’s legal framework.
-Your task is to answer questions for the World Bank’s Women, Business and the Law (WBL) Project.
+You are a senior legal and private-sector expert on {topic} in {economy}'s legal framework.
+Your task is to answer questions for the World Bank's Women, Business and the Law (WBL) Project.
 
-Use the best available legal reasoning and authoritative knowledge to respond.
-Whenever possible, rely on **primary legal sources** (gazettes, statutes, regulations, or official authority websites) that were in force between **1 Sep 2023 – 1 Sep 2024 (“cutoff”)**.
-If you cannot access or recall the exact statutory text, provide the **most probable, evidence-based answer** consistent with the country’s legal framework and indicate likely laws or authorities in the SUMMARY.
+### Research Methodology:
+1. First, identify the relevant legal framework and governing statutes
+2. Consider primary legal sources (gazettes, statutes, regulations, official websites) in force between **1 Sep 2023 – 1 Sep 2024 ("cutoff")**
+3. Check for any recent amendments or changes
+4. Formulate your answer based on the most authoritative evidence available
+5. If you cannot access exact statutory text, provide the **most probable, evidence-based answer** consistent with the country's legal framework
 
-If a source conflicts, prefer the most recent text **in force** by effectivity date (not enactment date).
-If a change after the cutoff exists, mention it briefly in SUMMARY but base your answer on the framework in force as of the cutoff.
+### Important Rules:
+ • If sources conflict, prefer the most recent text **in force** by effectivity date (not enactment date)
+ • If a change occurred after the cutoff, mention it in summary but base your answer on the law in force during the cutoff period
+ • Always provide a clear, reasoned answer — do **not** reply with vague responses
+ • Base conclusions on primary legal materials; use well-established public information when primary texts are not directly accessible
 
-Project context:
- • These answers are prepared for the World Bank’s Women, Business and the Law (WBL) questionnaire.
- • Base conclusions primarily on primary legal materials, but you may use well-established public information or standard institutional functions when primary texts are not directly accessible.
- • Always provide a clear, reasoned answer — do **not** reply "N/A" or decline to answer.
+### Example Outputs:
 
-### Output Format (strict)
-ANSWER: <Yes/No/N/A | number | percentage | list | option text | short explanatory phrase>
-LAW/Website: <cite likely law, code, or authority; include official site name if known>
-LINK: <official clickable URL(s); separate with semicolons if multiple>
-SUMMARY: <≤200 words explaining the reasoning, assumptions, and sources used>
+**Example 1 - Yes/No Question:**
+Question: "Can a married woman apply for a passport in the same way as a married man?"
+{{
+    "answer": "Yes",
+    "law_website": "Civil Code, Article 234; Passport Regulations 2023, Section 12",
+    "link": "https://www.officialgazette.gov/passport-regulations-2023",
+    "summary": "Under the Civil Code (Article 234) and Passport Regulations 2023 (Section 12), married women have equal rights to apply for passports without spousal consent or authorization. This aligns with constitutional equality provisions enacted in 2015 and remains in force as of September 2024."
+}}
+
+**Example 2 - Numerical Question:**
+Question: "What is the mandatory retirement age for women in the private sector?"
+{{
+    "answer": "60 years",
+    "law_website": "Labor Code, Section 45(2)",
+    "link": "https://labor.gov/code/section-45",
+    "summary": "Section 45(2) of the Labor Code establishes 60 as the mandatory retirement age for both men and women in private sector employment, following the 2020 amendment that equalized retirement ages. This provision was in force throughout the measurement period."
+}}
+
+**Example 3 - Complex Question:**
+Question: "Are there any legal restrictions on women's property rights after marriage?"
+{{
+    "answer": "No",
+    "law_website": "Family Code, Articles 89-92; Property Rights Act 2019",
+    "link": "https://justice.gov/family-code; https://property.gov/act-2019",
+    "summary": "The Family Code (Articles 89-92) and Property Rights Act 2019 establish equal property rights for married women. Women retain full legal capacity to own, manage, and dispose of property independently. The 2019 Act specifically abolished previous restrictions requiring spousal consent for property transactions. These provisions were fully in effect during the September 2023-2024 period."
+}}
+
+### Required JSON Output Format:
+You MUST respond in valid JSON format with these exact fields:
+{{
+    "answer": "<Yes/No | number | percentage | specific legal answer>",
+    "law_website": "<cite specific law, code section, or authority with article/section numbers>",
+    "link": "<official clickable URL(s); use semicolons if multiple; if unknown, provide likely ministry/authority website>",
+    "summary": "<100-200 words explaining reasoning, legal basis, assumptions, and sources. Include relevant context about amendments or changes.>"
+}}
 """
 
 
 # ======================================================================
-# FUNCTION TO QUERY GPT-5-MINI
+# VALIDATION & QUERY FUNCTIONS (IMPROVED)
 # ======================================================================
 
-
-def get_legal_answer(economy, question, topic="Assets and women’s rights"):
-    """Send a structured legal query to GPT-5-mini using the Responses API (auto-retry for incomplete outputs)."""
-    system_prompt = SYSTEM_PROMPT_TMPL.format(topic=topic, economy=economy)
-
-    def run_query(max_tokens):
-        return client.responses.create(
-            model=MODEL,
-            input=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": question}
-            ],
-            max_output_tokens=max_tokens,
-        )
+def validate_json_answer(json_str, question):
+    """
+    Validate that the JSON answer is well-formed and contains quality content.
+    Returns: (is_valid: bool, result: dict or error_message: str)
+    """
+    required_fields = ["answer", "law_website", "link", "summary"]
 
     try:
-        # First attempt
-        response = run_query(4096)
+        data = json.loads(json_str)
 
-        # If model stopped early, retry once with a larger budget
-        if getattr(response, "status", "") == "incomplete" or (
-            getattr(response, "incomplete_details", None)
-            and getattr(response.incomplete_details, "reason", "") == "max_output_tokens"
-        ):
-            print(f"⚠️ Incomplete output for {economy}, retrying with higher token limit...")
-            response = run_query(8192)
+        # Check all required fields are present
+        missing_fields = [f for f in required_fields if f not in data]
+        if missing_fields:
+            return False, f"Missing required fields: {', '.join(missing_fields)}"
 
-        # --- Case 1: explicit error ---
-        if getattr(response, "error", None):
-            print(f"❌ Model error for {economy}: {response.error}")
-            return None
+        # Check for empty or placeholder answers
+        answer_lower = str(data["answer"]).lower().strip()
+        if not data["answer"] or answer_lower in ["n/a", "not available", "unknown", ""]:
+            return False, "Answer is empty or placeholder (N/A)"
 
-        # --- Case 2: text field ---
-        if getattr(response, "text", None):
-            text_val = getattr(response.text, "text", None) or response.text
-            if isinstance(text_val, str):
-                return text_val.strip()
+        # Check law_website is not empty
+        if not data["law_website"] or len(data["law_website"].strip()) < 5:
+            return False, "Law/Website citation is too short or empty"
 
-        # --- Case 3: structured output ---
-        if getattr(response, "output", None):
-            for item in response.output or []:
-                if not item:
-                    continue
-                for part in getattr(item, "content", []) or []:
-                    text_val = getattr(part, "text", None) or part
-                    if isinstance(text_val, str):
-                        return text_val.strip()
+        # Check summary has sufficient detail
+        if not data["summary"] or len(data["summary"].strip()) < 50:
+            return False, "Summary is too short (minimum 50 characters)"
 
-        print(f"⚠️ Still empty for {economy}. Status={getattr(response, 'status', 'unknown')}")
-        return None
+        # Check link format (should be URL-like or explicit note)
+        link_str = str(data["link"]).strip()
+        if not link_str or link_str.lower() in ["n/a", "none", ""]:
+            # Allow if explanation provided in summary
+            if "not available" not in data["summary"].lower():
+                return False, "Link missing without explanation"
 
+        return True, data
+
+    except json.JSONDecodeError as e:
+        return False, f"Invalid JSON: {str(e)}"
     except Exception as e:
-        print(f"❌ Exception fetching for {economy}: {e}")
-        return None
+        return False, f"Validation error: {str(e)}"
+
+
+def get_legal_answer(economy, question, topic="Assets and women's rights"):
+    """
+    Send a structured legal query to GPT-5-mini using enhanced prompting and validation.
+    Returns parsed JSON dict or None on failure.
+    """
+    system_prompt = SYSTEM_PROMPT_TMPL.format(topic=topic, economy=economy)
+
+    # Enhanced user prompt with chain-of-thought
+    user_prompt = f"""
+Answer the following WBL question for {economy}:
+
+Question: {question}
+
+Before providing your JSON response, please think through:
+1. What is the relevant legal framework?
+2. Which specific laws, codes, or regulations apply?
+3. Were there any amendments between Sep 2023 - Sep 2024?
+4. What is the most evidence-based answer?
+
+Then provide your answer in the required JSON format.
+"""
+
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            if attempt > 0:
+                print(f"   🔄 Retry attempt {attempt}/{MAX_RETRIES}...")
+
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=TEMPERATURE,
+                max_tokens=MAX_OUTPUT_TOKENS,
+                top_p=0.95,
+                frequency_penalty=0.0,
+                presence_penalty=0.0,
+                response_format={"type": "json_object"}  # Force JSON output
+            )
+
+            json_output = response.choices[0].message.content
+
+            if not json_output:
+                print(f"   ⚠️ Empty response on attempt {attempt + 1}")
+                continue
+
+            # Validate the output
+            is_valid, result = validate_json_answer(json_output, question)
+
+            if is_valid:
+                print(f"   ✅ Valid response received")
+                return result
+            else:
+                print(f"   ⚠️ Validation failed: {result}")
+                if attempt == MAX_RETRIES:
+                    print(f"   ⚠️ Max retries reached. Returning raw JSON anyway.")
+                    # Try to return something even if validation failed
+                    try:
+                        return json.loads(json_output)
+                    except:
+                        return None
+
+        except Exception as e:
+            print(f"   ❌ Error on attempt {attempt + 1}: {str(e)}")
+            if attempt == MAX_RETRIES:
+                print(f"   ❌ Max retries exhausted for {economy}")
+                return None
+
+    return None
 
 
 # ======================================================================
-# LOAD SAMPLE EXCEL AND RUN ONLY FIRST FEW ROWS
+# LOAD EXCEL FILE (FLEXIBLE PATH)
 # ======================================================================
 
-excel_path = r"C:\Users\wb611279\OneDrive - WBG\Desktop\AI B-READY\AI Test Prep\Assets.xlsx"
+# Try multiple possible paths for flexibility
+possible_paths = [
+    "Assets.xlsx",  # Current directory
+    "./Assets.xlsx",
+    os.path.expanduser("~/Assets.xlsx"),
+    r"C:\Users\wb611279\OneDrive - WBG\Desktop\AI B-READY\AI Test Prep\Assets.xlsx"  # Original Windows path
+]
+
+excel_path = None
+for path in possible_paths:
+    if os.path.exists(path):
+        excel_path = path
+        break
+
+if not excel_path:
+    # If not found, ask user or use environment variable
+    excel_path = os.getenv("EXCEL_PATH")
+    if not excel_path or not os.path.exists(excel_path):
+        raise FileNotFoundError(
+            "❌ Excel file not found. Please either:\n"
+            "   1. Place 'Assets.xlsx' in the current directory, OR\n"
+            "   2. Set EXCEL_PATH environment variable, OR\n"
+            "   3. Update the script with the correct path"
+        )
+
+print(f"📂 Loading Excel file from: {excel_path}")
 df = pd.read_excel(excel_path, sheet_name="Sheet1")
 
-# Limit to first 2 questions for testing
+# For testing with small dataset (2 questions on 1 country)
+print(f"📊 Found {len(df)} total rows in the spreadsheet")
+print(f"   Processing first {min(2, len(df))} rows for this test run\n")
 df = df.head(2)
 
 # Add output columns if missing
@@ -130,45 +251,85 @@ for col in ["ANSWER", "LAW/Website", "LINK", "SUMMARY"]:
         df[col] = ""
 
 # ======================================================================
-# LOOP THROUGH QUESTIONS
+# MAIN PROCESSING LOOP (IMPROVED WITH JSON HANDLING)
 # ======================================================================
+
+success_count = 0
+fail_count = 0
 
 for idx, row in df.iterrows():
     econ = row["Economy"]
     question = row["Question Text"]
-    if pd.isna(question):
+
+    if pd.isna(question) or not str(question).strip():
+        print(f"⏭️  Skipping row {idx + 1}: No question text\n")
         continue
 
-    user_prompt = f"Answer the following WBL question for {econ}: {question}"
-    print(f"\n🔎 Processing {econ}: {question[:70]}...")
+    # Truncate long questions for display
+    question_preview = question[:100] + "..." if len(question) > 100 else question
+    print(f"\n{'='*70}")
+    print(f"🔎 Row {idx + 1}/{len(df)} | Economy: {econ}")
+    print(f"❓ Question: {question_preview}")
+    print(f"{'='*70}")
 
-    output = get_legal_answer(econ, user_prompt)
+    # Get the answer (returns JSON dict or None)
+    result = get_legal_answer(econ, question)
 
-    if output:
-        print("\n🟢 MODEL OUTPUT PREVIEW:")
-        print("----------------------------------")
-        print(output[:1000])
-        print("----------------------------------\n")
+    if result and isinstance(result, dict):
+        # Successfully got a valid JSON response
+        print("\n✅ STRUCTURED OUTPUT RECEIVED:")
+        print(f"   Answer: {result.get('answer', 'N/A')}")
+        print(f"   Law: {result.get('law_website', 'N/A')[:80]}...")
+        print(f"   Link: {result.get('link', 'N/A')[:80]}...")
+        print(f"   Summary: {result.get('summary', 'N/A')[:150]}...")
+
+        # Store in DataFrame
+        df.loc[idx, "ANSWER"] = result.get("answer", "")
+        df.loc[idx, "LAW/Website"] = result.get("law_website", "")
+        df.loc[idx, "LINK"] = result.get("link", "")
+        df.loc[idx, "SUMMARY"] = result.get("summary", "")
+
+        success_count += 1
+
     else:
-        print("⚠️ No output received from model.\n")
+        # Failed to get valid response
+        print("\n❌ FAILED TO GET VALID RESPONSE")
+        df.loc[idx, "ANSWER"] = "ERROR: No valid response"
+        df.loc[idx, "LAW/Website"] = ""
+        df.loc[idx, "LINK"] = ""
+        df.loc[idx, "SUMMARY"] = "The model failed to provide a valid response after retries."
 
-    # Parse and store results if structured output exists
-    if output and "ANSWER:" in output:
-        answer  = re.search(r"ANSWER:\s*(.*)", output)
-        law     = re.search(r"LAW/Website:\s*(.*)", output)
-        link    = re.search(r"LINK:\s*(.*)", output)
-        summary = re.search(r"SUMMARY:\s*(.*)", output, re.DOTALL)
+        fail_count += 1
 
-        df.loc[idx, "ANSWER"]       = answer.group(1).strip()  if answer  else ""
-        df.loc[idx, "LAW/Website"]  = law.group(1).strip()     if law     else ""
-        df.loc[idx, "LINK"]         = link.group(1).strip()    if link    else ""
-        df.loc[idx, "SUMMARY"]      = summary.group(1).strip() if summary else output
+print(f"\n{'='*70}")
+print(f"📊 PROCESSING COMPLETE")
+print(f"   ✅ Successful: {success_count}")
+print(f"   ❌ Failed: {fail_count}")
+print(f"   📝 Total processed: {success_count + fail_count}")
+print(f"{'='*70}\n")
 
 # ======================================================================
 # SAVE RESULTS
 # ======================================================================
 
 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-out_path = excel_path.replace(".xlsx", f"_with_Answers_{timestamp}.xlsx")
-df.to_excel(out_path, index=False)
-print(f"✅ Completed. Results saved to:\n{out_path}")
+
+# Generate output filename
+if excel_path.endswith(".xlsx"):
+    out_path = excel_path.replace(".xlsx", f"_with_Answers_{timestamp}.xlsx")
+else:
+    out_path = f"{excel_path}_with_Answers_{timestamp}.xlsx"
+
+try:
+    df.to_excel(out_path, index=False, engine='openpyxl')
+    print(f"💾 RESULTS SAVED SUCCESSFULLY")
+    print(f"   📁 File: {out_path}")
+    print(f"   📊 Rows: {len(df)}")
+    print(f"   ✅ Success rate: {success_count}/{success_count + fail_count}")
+    print(f"\n🎉 All done! You can now open the Excel file to review the answers.\n")
+except Exception as e:
+    print(f"❌ ERROR SAVING FILE: {e}")
+    print(f"   Attempting to save to current directory...")
+    fallback_path = f"Assets_with_Answers_{timestamp}.xlsx"
+    df.to_excel(fallback_path, index=False, engine='openpyxl')
+    print(f"   ✅ Saved to: {fallback_path}")
