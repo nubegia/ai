@@ -1,0 +1,174 @@
+# ======================================================================
+# QUICK-TEST SCRIPT — LEGAL ANSWER FETCHER (GPT-5-MINI FINAL VERSION)
+# ======================================================================
+
+import os
+import ssl
+import certifi
+import httpx
+import re
+import pandas as pd
+import datetime
+from openai import OpenAI
+
+# ─── CONFIG ───────────────────────────────────────────────────────────
+MODEL                 = os.getenv("OPENAI_MODEL", "gpt-5-mini")   # ✅ Use GPT-5-mini
+API_KEY               = ""  # ← replace with your valid key
+MAX_OUTPUT_TOKENS     = 1000
+HTTP_TIMEOUT_SECS     = 600
+
+if not API_KEY or not API_KEY.startswith("sk-"):
+    raise RuntimeError("❌ Missing or invalid OPENAI_API_KEY. Please provide a valid key.")
+
+_ctx   = ssl.create_default_context(cafile=certifi.where())
+_http  = httpx.Client(verify=_ctx, timeout=HTTP_TIMEOUT_SECS, follow_redirects=True)
+client = OpenAI(api_key=API_KEY, http_client=_http)
+
+print("✅ OpenAI client initialized successfully (GPT-5-mini).")
+
+# ======================================================================
+# SYSTEM PROMPT TEMPLATE
+# ======================================================================
+
+SYSTEM_PROMPT_TMPL = """
+You are a senior legal and private-sector expert on Assets and women’s rights in {economy}’s legal framework.
+Your task is to answer questions for the World Bank’s Women, Business and the Law (WBL) Project.
+
+Use the best available legal reasoning and authoritative knowledge to respond.
+Whenever possible, rely on **primary legal sources** (gazettes, statutes, regulations, or official authority websites) that were in force between **1 Sep 2023 – 1 Sep 2024 (“cutoff”)**.
+If you cannot access or recall the exact statutory text, provide the **most probable, evidence-based answer** consistent with the country’s legal framework and indicate likely laws or authorities in the SUMMARY.
+
+If a source conflicts, prefer the most recent text **in force** by effectivity date (not enactment date).
+If a change after the cutoff exists, mention it briefly in SUMMARY but base your answer on the framework in force as of the cutoff.
+
+Project context:
+ • These answers are prepared for the World Bank’s Women, Business and the Law (WBL) questionnaire.
+ • Base conclusions primarily on primary legal materials, but you may use well-established public information or standard institutional functions when primary texts are not directly accessible.
+ • Always provide a clear, reasoned answer — do **not** reply "N/A" or decline to answer.
+
+### Output Format (strict)
+ANSWER: <Yes/No/N/A | number | percentage | list | option text | short explanatory phrase>
+LAW/Website: <cite likely law, code, or authority; include official site name if known>
+LINK: <official clickable URL(s); separate with semicolons if multiple>
+SUMMARY: <≤200 words explaining the reasoning, assumptions, and sources used>
+"""
+
+
+# ======================================================================
+# FUNCTION TO QUERY GPT-5-MINI
+# ======================================================================
+
+
+def get_legal_answer(economy, question, topic="Assets and women’s rights"):
+    """Send a structured legal query to GPT-5-mini using the Responses API (auto-retry for incomplete outputs)."""
+    system_prompt = SYSTEM_PROMPT_TMPL.format(topic=topic, economy=economy)
+
+    def run_query(max_tokens):
+        return client.responses.create(
+            model=MODEL,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": question}
+            ],
+            max_output_tokens=max_tokens,
+        )
+
+    try:
+        # First attempt
+        response = run_query(4096)
+
+        # If model stopped early, retry once with a larger budget
+        if getattr(response, "status", "") == "incomplete" or (
+            getattr(response, "incomplete_details", None)
+            and getattr(response.incomplete_details, "reason", "") == "max_output_tokens"
+        ):
+            print(f"⚠️ Incomplete output for {economy}, retrying with higher token limit...")
+            response = run_query(8192)
+
+        # --- Case 1: explicit error ---
+        if getattr(response, "error", None):
+            print(f"❌ Model error for {economy}: {response.error}")
+            return None
+
+        # --- Case 2: text field ---
+        if getattr(response, "text", None):
+            text_val = getattr(response.text, "text", None) or response.text
+            if isinstance(text_val, str):
+                return text_val.strip()
+
+        # --- Case 3: structured output ---
+        if getattr(response, "output", None):
+            for item in response.output or []:
+                if not item:
+                    continue
+                for part in getattr(item, "content", []) or []:
+                    text_val = getattr(part, "text", None) or part
+                    if isinstance(text_val, str):
+                        return text_val.strip()
+
+        print(f"⚠️ Still empty for {economy}. Status={getattr(response, 'status', 'unknown')}")
+        return None
+
+    except Exception as e:
+        print(f"❌ Exception fetching for {economy}: {e}")
+        return None
+
+
+# ======================================================================
+# LOAD SAMPLE EXCEL AND RUN ONLY FIRST FEW ROWS
+# ======================================================================
+
+excel_path = r"C:\Users\wb611279\OneDrive - WBG\Desktop\AI B-READY\AI Test Prep\Assets.xlsx"
+df = pd.read_excel(excel_path, sheet_name="Sheet1")
+
+# Limit to first 2 questions for testing
+df = df.head(2)
+
+# Add output columns if missing
+for col in ["ANSWER", "LAW/Website", "LINK", "SUMMARY"]:
+    if col not in df.columns:
+        df[col] = ""
+
+# ======================================================================
+# LOOP THROUGH QUESTIONS
+# ======================================================================
+
+for idx, row in df.iterrows():
+    econ = row["Economy"]
+    question = row["Question Text"]
+    if pd.isna(question):
+        continue
+
+    user_prompt = f"Answer the following WBL question for {econ}: {question}"
+    print(f"\n🔎 Processing {econ}: {question[:70]}...")
+
+    output = get_legal_answer(econ, user_prompt)
+
+    if output:
+        print("\n🟢 MODEL OUTPUT PREVIEW:")
+        print("----------------------------------")
+        print(output[:1000])
+        print("----------------------------------\n")
+    else:
+        print("⚠️ No output received from model.\n")
+
+    # Parse and store results if structured output exists
+    if output and "ANSWER:" in output:
+        answer  = re.search(r"ANSWER:\s*(.*)", output)
+        law     = re.search(r"LAW/Website:\s*(.*)", output)
+        link    = re.search(r"LINK:\s*(.*)", output)
+        summary = re.search(r"SUMMARY:\s*(.*)", output, re.DOTALL)
+
+        df.loc[idx, "ANSWER"]       = answer.group(1).strip()  if answer  else ""
+        df.loc[idx, "LAW/Website"]  = law.group(1).strip()     if law     else ""
+        df.loc[idx, "LINK"]         = link.group(1).strip()    if link    else ""
+        df.loc[idx, "SUMMARY"]      = summary.group(1).strip() if summary else output
+
+# ======================================================================
+# SAVE RESULTS
+# ======================================================================
+
+timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+out_path = excel_path.replace(".xlsx", f"_with_Answers_{timestamp}.xlsx")
+df.to_excel(out_path, index=False)
+print(f"✅ Completed. Results saved to:\n{out_path}")
